@@ -1,0 +1,202 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import psycopg2
+from dotenv import load_dotenv
+import argparse, os, pathlib, logging, pickle
+from typing import Tuple
+
+load_dotenv()
+
+cli = argparse.ArgumentParser()
+cli.add_argument("--symbol",     default="AAPL")
+cli.add_argument("--lookback",   type=int, default=365, help="days of history")
+cli.add_argument("--k",          type=float, default=0.5, help="drift k")
+cli.add_argument("--h",          type=float, default=5.0, help="threshold h")
+cli.add_argument("--dbhost",     default=os.getenv("DB_HOST", "localhost"))
+cli.add_argument("--dbport",     type=int,  default=int(os.getenv("DB_PORT",5432)))
+cli.add_argument("--dbname",     default=os.getenv("DB_NAME", "financial_data"))
+cli.add_argument("--dbuser",     default=os.getenv("DB_USER", "feed_reader"))
+cli.add_argument("--dbpass",     default=os.getenv("DB_PASSWORD", ""))
+args = cli.parse_args()
+
+
+DB_KWARGS = dict(
+    host     = os.getenv("DB_HOST", "localhost"),
+    port     = int(os.getenv("DB_PORT", 5432)),
+    dbname   = os.getenv("DB_NAME", "financial_data"),
+    user     = os.getenv("DB_USER", "feed_reader"),
+    password = os.getenv("DB_PASSWORD", ""),
+)
+
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+
+
+SYMBOL             = args.symbol.upper()
+PRICE_TABLE        = "stock_data.daily_prices"
+STATE_PATH         = SCRIPT_DIR / f"state_{SYMBOL}.pkl"
+LOGFILE            = SCRIPT_DIR / f"nightly_{SYMBOL}.log"
+
+WARM_WINDOW_DAYS   = args.warm
+PLOT_WINDOW_DAYS   = args.plot_window
+K_DRIFT            = args.k
+H_THRESHOLD        = args.h
+REFRACTORY_DAYS    = args.refractory
+
+logging.basicConfig(
+    filename=LOGFILE,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(f"cusum_{SYMBOL.lower()}")
+
+class CUSUMDetector:
+    def __init__(self, mu0, sigma0, k=0.5, h=5.0, *, two_sided=True):
+        self.mu0 = mu0
+        self.sigma0 = sigma0
+        self.k = k
+        self.h = h
+        self.two_sided = two_sided
+        self.reset()
+    
+    def reset(self):
+        self.gp = self.gn = 0.0
+    
+    def step(self, x):
+        self.t += 1
+        z = (x - self.mu0) / self.sigma0
+        self.gp = max(0.0, self.gp + self.gp + z - self.k)
+        up = self.gp > self.h
+        down = False
+        if self.two:
+            self.gn = max(0.0, self.gn - z - self.k)
+            down = self.gn > self.h
+        if up or down:
+            d = 1 if up else -1
+            stat = self.gp if up else self.gn
+            self.reset()
+            return True, d, stat
+        return False, None, max(self.gp, self.gn)
+    
+def db_connection():
+    return psycopg2.connect(**DB_KWARGS)
+
+
+def load_window() -> pd.Series:
+    sql = f"""
+        WITH sid AS (SELECT id FROM stock_data.symbols WHERE symbol=%s)
+        SELECT p.date, p.close
+        FROM {PRICE_TABLE} p, sid
+        WHERE p.symbol_id = sid.id
+            AND p.date >= CURRENT_DATE - INTERVAL '{days} days'
+        ORDER BY p.date;
+    """
+    
+    with db_connection() as conn:
+        return (pd.read_sql(sql, conn, params=(SYMBOL, ), parse_dates=["dates"]).set_index("date")["close"])
+    
+def fetch_since(last_dt) -> pd.Series:
+    sql = f"""
+        WITH sid AS (SELECT id FROM stock_data.symbols WHERE symbols=%s)
+        SELECT p.date, p.close
+        FROM {PRICE_TABLE} p, sid
+        WHERE p.symbol_id = sid.id
+            AND p.date > %s
+        ORDER BY p.date;
+    """
+    
+    with db_connection() as conn:
+        return (pd.read_sql(sql, conn, params=(SYMBOL, last_dt), parse_dates=["dates"]).set_index("date")["close"])
+    
+
+def save_state(det, last_dt, hist):
+    with STATE_PATH.with_suffix(".tmp").open("wb") as f:
+        pickle.dump({"detector": det, "last": last_dt, "hist": hist}, f, -1)
+    STATE_PATH.with_suffix(".tmp").replace(STATE_PATH)
+    logger.info("State saved - last-date=%s", last_dt.date())
+    
+
+def load_state() -> Tuple[CUSUMDetector, pd.Timestamp, pd.Series]:
+    if STATE_PATH.exists():
+        with STATE_PATH.open("rb") as f:
+            p = pickle.load(f)
+        logger.info("State loaded – last-date=%s", p["last"].date())
+        return p["detector"], p["last"], p["hist"]
+    
+    warm = load_window(WARM_WINDOW_DAYS)
+    det  = CUSUMDetector(warm.mean(), warm.std(ddof=1),
+                         k=K_DRIFT, h=H_THRESHOLD, two_sided=True)
+    for v in warm.values:
+        det.step(float(v))
+    last = warm.index.max()
+    save_state(det, last, warm)
+    return det, last, warm
+
+
+def make_plot(price, cusum_vals, cps):
+    tail_p = price.iloc[-PLOT_WINDOW_DAYS:]
+    tail_c = pd.Series(cusum_vals, index=price.index).iloc[-PLOT_WINDOW_DAYS:]
+
+    fig, (axp, axc) = plt.subplots(2, 1, figsize=(10,6), sharex=True)
+    tail_p.plot(ax=axp, lw=1)
+    axp.set_ylabel("price")
+    tail_c.plot(ax=axc, lw=1)
+    axc.axhline(H_THRESHOLD,  color="r", ls="--", lw=.8)
+    axc.axhline(-H_THRESHOLD, color="r", ls="--", lw=.8)
+    axc.set_ylabel("CUSUM")
+    for cp in cps:
+        if cp in tail_p.index:
+            axp.axvline(cp, color="red", lw=1, alpha=.6)
+            axc.axvline(cp, color="red", lw=1, alpha=.6)
+    fig.suptitle(f"{SYMBOL} – last {PLOT_WINDOW_DAYS} days (CUSUM)")
+    out_file = SCRIPT_DIR / f"plot_{SYMBOL}.png"
+    fig.tight_layout(); fig.savefig(out_file, dpi=150); plt.close(fig)
+    logger.info("Plot saved → %s", out_file.relative_to(SCRIPT_DIR))
+    
+    
+def main():
+    det, last_dt, price_hist = load_state()
+    new_rows = fetch_since(last_dt)
+    
+    det_full = CUSUMDetector(det.mu0, det.sigma0,
+                             k=K_DRIFT, h=H_THRESHOLD, two_sided=True)
+    cusum_all, cp_dates = [], []
+    for ts, px in price_hist.items():
+        is_cp, _, stat = det_full.step(float(px))
+        cusum_all.append(stat)
+        if is_cp:
+            cp_dates.append(ts)
+            
+    cooldown = 0
+    if not new_rows.empty:
+        for ts, px in new_rows.items():
+            is_cp, direction, stat = det.step(float(px))
+            cusum_all.append(stat)
+            price_hist.loc[ts] = px
+
+            if cooldown == 0 and is_cp:
+                cp_dates.append(ts)
+                logger.info("CUSUM shift %s at %s  stat=%.2f  refractory=%dd",
+                            "↑" if direction>0 else "↓",
+                            ts.date(), stat, REFRACTORY_DAYS)
+                cooldown = REFRACTORY_DAYS
+
+            if cooldown > 0:
+                cooldown -= 1
+    else:
+        logger.info("No new data - plotting existing history")
+    
+    if cp_dates:
+        logger.info("Changepoints up to %s: %s",
+                    price_hist.index.max().date(),
+                    ", ".join(d.date().isoformat() for d in cp_dates))
+
+    make_plot(price_hist, cusum_all, cp_dates)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        logger.exception("Nightly CUSUM run failed: %s", exc)
+        raise
+
