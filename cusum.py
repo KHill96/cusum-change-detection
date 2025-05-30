@@ -13,20 +13,20 @@ cli.add_argument("--symbol",     default="AAPL")
 cli.add_argument("--lookback",   type=int, default=365, help="days of history")
 cli.add_argument("--k",          type=float, default=0.5, help="drift k")
 cli.add_argument("--h",          type=float, default=5.0, help="threshold h")
-cli.add_argument("--dbhost",     default=os.getenv("DB_HOST", "localhost"))
-cli.add_argument("--dbport",     type=int,  default=int(os.getenv("DB_PORT",5432)))
-cli.add_argument("--dbname",     default=os.getenv("DB_NAME", "financial_data"))
-cli.add_argument("--dbuser",     default=os.getenv("DB_USER", "feed_reader"))
-cli.add_argument("--dbpass",     default=os.getenv("DB_PASSWORD", ""))
+cli.add_argument('--refractory', type=int, default=5, help="days to skip after detecting a changepoint" )
+cli.add_argument("--warm", type=int, default=180, help="warm-up days")
+cli.add_argument("--plot-window", type=int, default=250, help="tail in plot")
+cli.add_argument("--dry-run", type=bool, default=False, help="Run without saving state")
+
 args = cli.parse_args()
 
 
 DB_KWARGS = dict(
-    host     = os.getenv("DB_HOST", "localhost"),
-    port     = int(os.getenv("DB_PORT", 5432)),
-    dbname   = os.getenv("DB_NAME", "financial_data"),
-    user     = os.getenv("DB_USER", "feed_reader"),
-    password = os.getenv("DB_PASSWORD", ""),
+    host     = os.getenv("DB_HOST"),
+    port     = int(os.getenv("DB_PORT")),
+    dbname   = os.getenv("DB_NAME"),
+    user     = os.getenv("DB_USER"),
+    password = os.getenv("DB_PASSWORD"),
 )
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
@@ -61,14 +61,15 @@ class CUSUMDetector:
     
     def reset(self):
         self.gp = self.gn = 0.0
+        self.t = -1
     
     def step(self, x):
         self.t += 1
         z = (x - self.mu0) / self.sigma0
-        self.gp = max(0.0, self.gp + self.gp + z - self.k)
+        self.gp = max(0.0, self.gp + z - self.k)
         up = self.gp > self.h
         down = False
-        if self.two:
+        if self.two_sided:
             self.gn = max(0.0, self.gn - z - self.k)
             down = self.gn > self.h
         if up or down:
@@ -82,7 +83,7 @@ def db_connection():
     return psycopg2.connect(**DB_KWARGS)
 
 
-def load_window() -> pd.Series:
+def load_window(days) -> pd.Series:
     sql = f"""
         WITH sid AS (SELECT id FROM stock_data.symbols WHERE symbol=%s)
         SELECT p.date, p.close
@@ -93,11 +94,11 @@ def load_window() -> pd.Series:
     """
     
     with db_connection() as conn:
-        return (pd.read_sql(sql, conn, params=(SYMBOL, ), parse_dates=["dates"]).set_index("date")["close"])
+        return (pd.read_sql(sql, conn, params=(SYMBOL, ), parse_dates=["date"]).set_index("date")["close"])
     
 def fetch_since(last_dt) -> pd.Series:
     sql = f"""
-        WITH sid AS (SELECT id FROM stock_data.symbols WHERE symbols=%s)
+        WITH sid AS (SELECT id FROM stock_data.symbols WHERE symbol=%s)
         SELECT p.date, p.close
         FROM {PRICE_TABLE} p, sid
         WHERE p.symbol_id = sid.id
@@ -106,7 +107,7 @@ def fetch_since(last_dt) -> pd.Series:
     """
     
     with db_connection() as conn:
-        return (pd.read_sql(sql, conn, params=(SYMBOL, last_dt), parse_dates=["dates"]).set_index("date")["close"])
+        return (pd.read_sql(sql, conn, params=(SYMBOL, last_dt), parse_dates=["date"]).set_index("date")["close"])
     
 
 def save_state(det, last_dt, hist):
@@ -120,7 +121,7 @@ def load_state() -> Tuple[CUSUMDetector, pd.Timestamp, pd.Series]:
     if STATE_PATH.exists():
         with STATE_PATH.open("rb") as f:
             p = pickle.load(f)
-        logger.info("State loaded – last-date=%s", p["last"].date())
+        logger.info("State loaded - last-date=%s", p["last"].date())
         return p["detector"], p["last"], p["hist"]
     
     warm = load_window(WARM_WINDOW_DAYS)
@@ -148,13 +149,15 @@ def make_plot(price, cusum_vals, cps):
         if cp in tail_p.index:
             axp.axvline(cp, color="red", lw=1, alpha=.6)
             axc.axvline(cp, color="red", lw=1, alpha=.6)
-    fig.suptitle(f"{SYMBOL} – last {PLOT_WINDOW_DAYS} days (CUSUM)")
+    fig.suptitle(f"{SYMBOL} - last {PLOT_WINDOW_DAYS} days (CUSUM)")
     out_file = SCRIPT_DIR / f"plot_{SYMBOL}.png"
     fig.tight_layout(); fig.savefig(out_file, dpi=150); plt.close(fig)
     logger.info("Plot saved → %s", out_file.relative_to(SCRIPT_DIR))
     
     
 def main():
+    if args.dry_run:
+        logger.warning("Running in DRY MODE - changes will not be saved.")
     det, last_dt, price_hist = load_state()
     new_rows = fetch_since(last_dt)
     
@@ -183,6 +186,7 @@ def main():
 
             if cooldown > 0:
                 cooldown -= 1
+        save_state(det, price_hist.index.max(), price_hist)
     else:
         logger.info("No new data - plotting existing history")
     
@@ -192,6 +196,11 @@ def main():
                     ", ".join(d.date().isoformat() for d in cp_dates))
 
     make_plot(price_hist, cusum_all, cp_dates)
+
+    if not new_rows.empty and not args.dry_run:
+        save_state(det, price_hist.index.max(), price_hist)
+    elif args.dry_run:
+        logger.info("Dry run - no state was saved.")
 
 if __name__ == "__main__":
     try:
