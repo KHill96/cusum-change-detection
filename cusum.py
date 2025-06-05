@@ -16,8 +16,13 @@ cli.add_argument("--h",          type=float, default=5.0, help="threshold h")
 cli.add_argument('--refractory', type=int, default=5, help="days to skip after detecting a changepoint" )
 cli.add_argument("--warm", type=int, default=180, help="warm-up days")
 cli.add_argument("--plot-window", type=int, default=250, help="tail in plot")
-cli.add_argument("--dry-run", type=bool, default=False, help="Run without saving state")
-
+cli.add_argument("--dry-run", action="store_true", help="run without persisting state")
+cli.add_argument("--force", action="store_true",
+                 help="rebuild state ignoring cache")
+cli.add_argument("--min-run", type=int, default=10,
+                 help="minimum bars between change-points")
+cli.add_argument("--sigma-cap", type=float, default=2.5,
+                 help="cap σ at this multiple of initial σ")
 args = cli.parse_args()
 
 
@@ -62,6 +67,16 @@ class CUSUMDetector:
     def reset(self):
         self.gp = self.gn = 0.0
         self.t = -1
+        
+    def set_baseline(self, mu0: float, sigma0: float):
+        """
+        Update the in-control mean and stdev after a detected shift, then
+        clear the cumulative scores so that monitoring restarts from zero.
+        """
+        self.mu0    = mu0
+        # avoid division-by-zero in very quiet markets
+        self.sigma0 = max(sigma0, 1e-8)
+        self.reset()
     
     def step(self, x):
         self.t += 1
@@ -121,17 +136,21 @@ def load_state() -> Tuple[CUSUMDetector, pd.Timestamp, pd.Series]:
     if STATE_PATH.exists():
         with STATE_PATH.open("rb") as f:
             p = pickle.load(f)
-        logger.info("State loaded - last-date=%s", p["last"].date())
-        return p["detector"], p["last"], p["hist"]
-    
-    warm = load_window(WARM_WINDOW_DAYS)
-    det  = CUSUMDetector(warm.mean(), warm.std(ddof=1),
-                         k=K_DRIFT, h=H_THRESHOLD, two_sided=True)
+        if len(p["hist"]) >= args.lookback:          # cached long enough
+            logger.info("State loaded – last=%s", p["last"].date())
+            return p["detector"], p["last"], p["hist"]
+        logger.info("Existing state too short – rebuilding ...")
+
+    # fresh build
+    full_hist = load_window(args.lookback)           # ← use lookback!
+    warm      = full_hist.iloc[:WARM_WINDOW_DAYS]
+    det       = CUSUMDetector(warm.mean(), warm.std(ddof=1),
+                              k=K_DRIFT, h=H_THRESHOLD)
     for v in warm.values:
         det.step(float(v))
-    last = warm.index.max()
-    save_state(det, last, warm)
-    return det, last, warm
+    last = full_hist.index.max()
+    save_state(det, last, full_hist)
+    return det, last, full_hist
 
 
 def make_plot(price, cusum_vals, cps):
@@ -150,7 +169,7 @@ def make_plot(price, cusum_vals, cps):
             axp.axvline(cp, color="red", lw=1, alpha=.6)
             axc.axvline(cp, color="red", lw=1, alpha=.6)
     fig.suptitle(f"{SYMBOL} - last {PLOT_WINDOW_DAYS} days (CUSUM)")
-    out_file = SCRIPT_DIR / f"plot_{SYMBOL}.png"
+    out_file = SCRIPT_DIR / f"plot_{SYMBOL}_3_why.png"
     fig.tight_layout(); fig.savefig(out_file, dpi=150); plt.close(fig)
     logger.info("Plot saved → %s", out_file.relative_to(SCRIPT_DIR))
     
@@ -162,15 +181,27 @@ def main():
     new_rows = fetch_since(last_dt)
     
     det_full = CUSUMDetector(det.mu0, det.sigma0,
-                             k=K_DRIFT, h=H_THRESHOLD, two_sided=True)
+                         k=K_DRIFT, h=H_THRESHOLD, two_sided=True)
     cusum_all, cp_dates = [], []
-    for ts, px in price_hist.items():
+    for idx, (ts, px) in enumerate(price_hist.items()):
         is_cp, _, stat = det_full.step(float(px))
         cusum_all.append(stat)
         if is_cp:
             cp_dates.append(ts)
+
+            # SAME trailing-window logic you use in streaming part
+            win_start = ts - pd.Timedelta(days=WARM_WINDOW_DAYS)
+            win = price_hist.loc[win_start:ts]
+            if len(win) < 30:
+                win = price_hist.iloc[max(0, idx-29):idx+1]
+
+            det_full.set_baseline(float(win.mean()), float(win.std(ddof=1)))
+
+            logger.info("Replay reset @%s → μ=%.3f  σ=%.3f  n=%d",
+                        ts.date(), det_full.mu0, det_full.sigma0, len(win))
             
-    cooldown = 0
+        cooldown = 0
+        
     if not new_rows.empty:
         for ts, px in new_rows.items():
             is_cp, direction, stat = det.step(float(px))
@@ -183,7 +214,18 @@ def main():
                             "↑" if direction>0 else "↓",
                             ts.date(), stat, REFRACTORY_DAYS)
                 cooldown = REFRACTORY_DAYS
+                win_start = ts - pd.Timedelta(days=WARM_WINDOW_DAYS)
+                baseline_window = price_hist.loc[win_start:ts]
+                # fall back to last 30 obs if the normal warm window is too short
+                if len(baseline_window) < 30:
+                    baseline_window = price_hist.iloc[-30:]
 
+                new_mu = float(baseline_window.mean())
+                new_sd = float(baseline_window.std(ddof=1))
+
+                det.set_baseline(new_mu, new_sd)
+                logger.info("Baseline reset → μ=%.3f  σ=%.3f  (n=%d)",
+                            new_mu, new_sd, len(baseline_window))
             if cooldown > 0:
                 cooldown -= 1
         save_state(det, price_hist.index.max(), price_hist)
